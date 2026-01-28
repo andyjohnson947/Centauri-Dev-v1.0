@@ -108,11 +108,19 @@ def get_sma():
     df.drop(columns=['time'], inplace=True)
     df['sma_6H'] = ta.trend.sma_indicator(df['high'], window=6)
     df['sma_6L'] = ta.trend.sma_indicator(df['low'], window=6)
+    df['sma_33'] = ta.trend.sma_indicator(df['close'], window=33)
+    df['sma_60'] = ta.trend.sma_indicator(df['close'], window=60)
+    df['sma_120'] = ta.trend.sma_indicator(df['close'], window=120)
+    df['sma_240'] = ta.trend.sma_indicator(df['close'], window=240)
     df['rsi'] = ta.momentum.rsi(df['close'], window=14)
 
-    global sma6H, sma6L, current_rsi, recent_candles
+    global sma6H, sma6L, sma33, sma60, sma120, sma240, current_rsi, recent_candles
     sma6H = df['sma_6H'].iloc[-1]
     sma6L = df['sma_6L'].iloc[-1]
+    sma33 = df['sma_33'].iloc[-1]
+    sma60 = df['sma_60'].iloc[-1]
+    sma120 = df['sma_120'].iloc[-1]
+    sma240 = df['sma_240'].iloc[-1]
     current_rsi = df['rsi'].iloc[-1]
 
     # Store recent candles for trend analysis (M1)
