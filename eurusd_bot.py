@@ -12,22 +12,17 @@
 import MetaTrader5 as mt5
 import pandas as pd
 import time
+import datetime
 import ta
 
 
 
 # Main settings
 magic = 12345678
-account_id = 1234567890
 
 # Symbol settings
 symbol = 'EURUSD'
 sl_multiplier = 13
-
-lot = 0.1
-add_lot = 0.03
-min_deleverage = 15
-deleverage_steps = 7
 take_profit_short = 21
 sl_short = take_profit_short * sl_multiplier
 
@@ -61,7 +56,6 @@ flip_cooldown_max = 2  # Wait 2 H4 candles after flip before allowing new flip
 last_h4_time = 0  # Track last processed H4 candle
 
 # Volume Profile approximation settings
-vp_lookback_daily = 1  # Days for daily VP calculation
 vp_lookback_h4 = 6  # H4 candles for H4 VP calculation
 vp_bins = 50  # Price bins for volume profile
 
@@ -114,21 +108,11 @@ def get_sma():
     df.drop(columns=['time'], inplace=True)
     df['sma_6H'] = ta.trend.sma_indicator(df['high'], window=6)
     df['sma_6L'] = ta.trend.sma_indicator(df['low'], window=6)
-    df['sma_33'] = ta.trend.sma_indicator(df['close'], window=33)
-    df['sma_60'] = ta.trend.sma_indicator(df['close'], window=60)
-    df['sma_120'] = ta.trend.sma_indicator(df['close'], window=120)
-    df['sma_240'] = ta.trend.sma_indicator(df['close'], window=240)
-
-    # RSI for trend detection
     df['rsi'] = ta.momentum.rsi(df['close'], window=14)
 
-    global sma6H, sma6L, sma33, sma60, sma120, sma240, current_rsi, recent_candles
+    global sma6H, sma6L, current_rsi, recent_candles
     sma6H = df['sma_6H'].iloc[-1]
     sma6L = df['sma_6L'].iloc[-1]
-    sma33 = df['sma_33'].iloc[-1]
-    sma60 = df['sma_60'].iloc[-1]
-    sma120 = df['sma_120'].iloc[-1]
-    sma240 = df['sma_240'].iloc[-1]
     current_rsi = df['rsi'].iloc[-1]
 
     # Store recent candles for trend analysis (M1)
@@ -239,9 +223,10 @@ def calculate_volume_profile(bars_df):
 def get_htf_data():
     """
     Fetch Daily and H4 data for regime detection.
-    Returns: (daily_df, h4_df, poc_daily, vah_daily, val_daily, poc_h4, poc_h4_prev)
+    Returns: (daily_df, h4_df) or None if data unavailable.
+    Also updates global poc_daily, vah_daily, val_daily, poc_h4, poc_h4_prev.
     """
-    global poc_daily, vah_daily, val_daily, poc_h4, poc_h4_prev, h4_df
+    global poc_daily, vah_daily, val_daily, poc_h4, poc_h4_prev, h4_df, daily_df
 
     # Fetch Daily data (last 5 days for context)
     daily_bars = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_D1, 0, 5)
@@ -276,7 +261,6 @@ def get_htf_data():
 
 def is_illiquid_time():
     """Check if current time is in illiquid period (Asia session, NY close)"""
-    import datetime
     now = datetime.datetime.utcnow()
     hour = now.hour
 
@@ -300,20 +284,18 @@ def check_daily_permits_flip():
     - POC flat or lower vs yesterday
     - Daily close inside prior value area
     - Failure at VAH occurred
+
+    Uses cached daily_df from get_htf_data() to avoid duplicate API calls.
     """
-    global poc_daily, vah_daily, val_daily
+    global poc_daily, vah_daily, val_daily, daily_df
 
     if poc_daily is None or vah_daily is None:
         return False
 
-    # Get yesterday's close
-    daily_bars = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_D1, 0, 3)
-    if daily_bars is None or len(daily_bars) < 3:
+    if daily_df is None or len(daily_df) < 3:
         return False
 
-    daily_df = pd.DataFrame(daily_bars)
-
-    # Calculate POC for day before yesterday
+    # Calculate POC for day before yesterday (using cached data)
     prev_daily = daily_df.iloc[-3:-2]
     poc_prev, vah_prev, val_prev = calculate_volume_profile(prev_daily)
 
@@ -327,9 +309,6 @@ def check_daily_permits_flip():
 
     # Condition 2: Daily close inside prior value area
     close_in_value = val_prev <= yesterday_close <= vah_prev if val_prev and vah_prev else False
-
-    # Condition 3: Failure at VAH (checked separately in H4 logic)
-    # This is set by H4 analysis
 
     return poc_migration or close_in_value
 
@@ -725,11 +704,121 @@ def check_hedge_recovery():
 # Define prices
 def get_ask_bid():
     global ask, bid
-    ask = mt5.symbol_info_tick(symbol).ask
-    bid = mt5.symbol_info_tick(symbol).bid
+    tick = mt5.symbol_info_tick(symbol)
+    if tick is None:
+        return False
+    ask = tick.ask
+    bid = tick.bid
+    return True
 
 point = mt5.symbol_info(symbol).point
 deviation = 20
+
+
+def build_sell_order(lot_size, comment):
+    """Build sell order dict with fresh price"""
+    return {
+        "action": mt5.TRADE_ACTION_DEAL,
+        "symbol": symbol,
+        "volume": lot_size,
+        "type": mt5.ORDER_TYPE_SELL,
+        "price": bid,
+        "sl": bid + sl_short * point,
+        "tp": bid - take_profit_short * point,
+        "deviation": deviation,
+        "magic": magic,
+        "comment": comment,
+        "type_time": mt5.ORDER_TIME_GTC,
+        "type_filling": mt5.ORDER_FILLING_IOC,
+    }
+
+
+def build_buy_order(lot_size, comment):
+    """Build buy order dict with fresh price"""
+    return {
+        "action": mt5.TRADE_ACTION_DEAL,
+        "symbol": symbol,
+        "volume": lot_size,
+        "type": mt5.ORDER_TYPE_BUY,
+        "price": ask,
+        "sl": ask - sl_long * point,
+        "tp": ask + take_profit_long * point,
+        "deviation": deviation,
+        "magic": magic,
+        "comment": comment,
+        "type_time": mt5.ORDER_TIME_GTC,
+        "type_filling": mt5.ORDER_FILLING_IOC,
+    }
+
+
+def build_avg_sell_order(lot_size, entry_price, comment):
+    """Build averaging sell order with SL/TP based on entry price"""
+    return {
+        "action": mt5.TRADE_ACTION_DEAL,
+        "symbol": symbol,
+        "volume": lot_size,
+        "type": mt5.ORDER_TYPE_SELL,
+        "price": bid,
+        "sl": entry_price + sl_short * point,
+        "tp": entry_price - take_profit_short * point,
+        "deviation": deviation,
+        "magic": magic,
+        "comment": comment,
+        "type_time": mt5.ORDER_TIME_GTC,
+        "type_filling": mt5.ORDER_FILLING_IOC,
+    }
+
+
+def build_avg_buy_order(lot_size, entry_price, comment):
+    """Build averaging buy order with SL/TP based on entry price"""
+    return {
+        "action": mt5.TRADE_ACTION_DEAL,
+        "symbol": symbol,
+        "volume": lot_size,
+        "type": mt5.ORDER_TYPE_BUY,
+        "price": ask,
+        "sl": entry_price - sl_long * point,
+        "tp": entry_price + take_profit_long * point,
+        "deviation": deviation,
+        "magic": magic,
+        "comment": comment,
+        "type_time": mt5.ORDER_TIME_GTC,
+        "type_filling": mt5.ORDER_FILLING_IOC,
+    }
+
+
+def build_sltp_sell(pos_id, vol, entry_price):
+    """Build SL/TP modification for sell position"""
+    return {
+        "action": mt5.TRADE_ACTION_SLTP,
+        "symbol": symbol,
+        "volume": float(vol),
+        "type": mt5.ORDER_TYPE_SELL,
+        "position": pos_id,
+        "sl": entry_price + sl_short * point,
+        "tp": entry_price - take_profit_short * point,
+        "magic": magic,
+        "comment": "Update SL/TP for Sell",
+        "type_time": mt5.ORDER_TIME_GTC,
+        "type_filling": mt5.ORDER_FILLING_IOC,
+    }
+
+
+def build_sltp_buy(pos_id, vol, entry_price):
+    """Build SL/TP modification for buy position"""
+    return {
+        "action": mt5.TRADE_ACTION_SLTP,
+        "symbol": symbol,
+        "volume": float(vol),
+        "type": mt5.ORDER_TYPE_BUY,
+        "position": pos_id,
+        "sl": entry_price - sl_long * point,
+        "tp": entry_price + take_profit_long * point,
+        "magic": magic,
+        "comment": "Update SL/TP for Buy",
+        "type_time": mt5.ORDER_TIME_GTC,
+        "type_filling": mt5.ORDER_FILLING_IOC,
+    }
 
 
 short_positions = []
@@ -743,15 +832,16 @@ val_daily = None
 poc_h4 = None
 poc_h4_prev = None
 h4_df = None
+daily_df = None
 
 while True:
 
-    identifier = 0
-    volume = 0
-    pos_price = 0
-
     get_sma()
-    get_ask_bid()
+    if not get_ask_bid():
+        print("Failed to get tick data, retrying...")
+        time.sleep(0.5)
+        continue
+
     get_position_data()
 
     # Update HTF regime state (H4-led, Daily-anchored)
@@ -762,125 +852,30 @@ while True:
     current_lot = get_dynamic_lot()
     current_add_lot = get_dynamic_add_lot()
 
-    # Define Sell Order (with dynamic lot size) - for TREND_DOWN
-    sell_order = {
-        "action": mt5.TRADE_ACTION_DEAL,
-        "symbol": symbol,
-        "volume": current_lot,
-        "type": mt5.ORDER_TYPE_SELL,
-        "price": bid,
-        "sl": bid + sl_short * point,
-        "tp": bid - take_profit_short * point,
-        "deviation": deviation,
-        "magic": magic,
-        "comment": f"RYU-SHORT-{trade_counter}",
-        "type_time": mt5.ORDER_TIME_GTC,
-        "type_filling": mt5.ORDER_FILLING_IOC,
-    }
-
-    additional_sell_order = {
-        "action": mt5.TRADE_ACTION_DEAL,
-        "symbol": symbol,
-        "volume": current_add_lot,
-        "type": mt5.ORDER_TYPE_SELL,
-        "price": bid,
-        "sl": pos_price + sl_short * point,
-        "tp": pos_price - take_profit_short * point,
-        "deviation": deviation,
-        "magic": magic,
-        "comment": f"RYU-SAVG-{trade_counter}",
-        "type_time": mt5.ORDER_TIME_GTC,
-        "type_filling": mt5.ORDER_FILLING_IOC,
-    }
-
-    # Define Buy Order (with dynamic lot size) - for TREND_UP
-    buy_order = {
-        "action": mt5.TRADE_ACTION_DEAL,
-        "symbol": symbol,
-        "volume": current_lot,
-        "type": mt5.ORDER_TYPE_BUY,
-        "price": ask,
-        "sl": ask - sl_long * point,
-        "tp": ask + take_profit_long * point,
-        "deviation": deviation,
-        "magic": magic,
-        "comment": f"RYU-LONG-{trade_counter}",
-        "type_time": mt5.ORDER_TIME_GTC,
-        "type_filling": mt5.ORDER_FILLING_IOC,
-    }
-
-    additional_buy_order = {
-        "action": mt5.TRADE_ACTION_DEAL,
-        "symbol": symbol,
-        "volume": current_add_lot,
-        "type": mt5.ORDER_TYPE_BUY,
-        "price": ask,
-        "sl": long_pos_price - sl_long * point,
-        "tp": long_pos_price + take_profit_long * point,
-        "deviation": deviation,
-        "magic": magic,
-        "comment": f"RYU-LAVG-{trade_counter}",
-        "type_time": mt5.ORDER_TIME_GTC,
-        "type_filling": mt5.ORDER_FILLING_IOC,
-    }
-
-    sltp_request_sell_pos = {
-        "action": mt5.TRADE_ACTION_SLTP,
-        "symbol": symbol,
-        "volume": float(volume),
-        "type": mt5.ORDER_TYPE_SELL,
-        "position": identifier,
-        "sl": pos_price + sl_short * point,
-        "tp": pos_price - take_profit_short * point,
-        "magic": magic,
-        "comment": "Change stop loss for Sell position",
-        "type_time": mt5.ORDER_TIME_GTC,
-        "type_filling": mt5.ORDER_FILLING_IOC,
-    }
-
-    sltp_request_buy_pos = {
-        "action": mt5.TRADE_ACTION_SLTP,
-        "symbol": symbol,
-        "volume": float(long_volume),
-        "type": mt5.ORDER_TYPE_BUY,
-        "position": long_identifier,
-        "sl": long_pos_price - sl_long * point,
-        "tp": long_pos_price + take_profit_long * point,
-        "magic": magic,
-        "comment": "Change stop loss for Buy position",
-        "type_time": mt5.ORDER_TIME_GTC,
-        "type_filling": mt5.ORDER_FILLING_IOC,
-    }
-
     # MA conditions for entries
-    good_short_ma_order = bid > sma6H  # Price above SMA = good short entry
-    good_long_ma_order = ask < sma6L   # Price below SMA = good long entry
+    good_short_ma_order = bid > sma6H
+    good_long_ma_order = ask < sma6L
 
     # ==========================================
     # HEDGE LOGIC - Check for recovery first
     # ==========================================
     if hedge_active:
-        # Check if hedge has recovered - close all at breakeven
         if check_hedge_recovery():
             print("All positions closed at breakeven")
             time.sleep(0.1)
-            continue  # Skip rest of loop, start fresh
+            continue
 
     # ==========================================
     # HEDGE TRIGGER - At 3/4 of Stop Loss (for shorts)
     # ==========================================
     if pos_price > 0 and not hedge_active:
-        # Calculate drawdown in points
         drawdown_points = (ask - pos_price) / point
-
-        # Calculate hedge trigger level (75% of SL)
         hedge_trigger_points = sl_short * hedge_trigger_pct
 
         if drawdown_points >= hedge_trigger_points:
             print(f"SHORT DRAWDOWN: {drawdown_points:.1f} pts (Trigger: {hedge_trigger_points:.1f})")
             print(f"RSI: {current_rsi:.1f}")
 
-            # Check if market is trending (failsafe)
             if is_trending_up():
                 print("TRENDING DETECTED - Opening hedge")
                 open_hedge()
@@ -890,41 +885,65 @@ while True:
     # ==========================================
     # REGIME-BASED TRADING LOGIC
     # ==========================================
-    print(f"REGIME: {regime_state} | Short pos: {pos_price:.5f} | Long pos: {long_pos_price:.5f}")
+    print(f"REGIME: {regime_state} | Short: {pos_price:.5f} | Long: {long_pos_price:.5f}")
 
     # ----- TREND_DOWN: Only SHORT entries -----
     if regime_state == "TREND_DOWN":
         # First Short Entry
         if pos_price == 0 and good_short_ma_order and not hedge_active:
             trade_counter += 1
-            sell_order["comment"] = f"RYU-SHORT-{trade_counter}"
-            result = mt5.order_send(sell_order)
-            print(f"NEW SHORT #{trade_counter} - Regime: TREND_DOWN")
+            get_ask_bid()  # Refresh price before order
+            order = build_sell_order(current_lot, f"RYU-SHORT-{trade_counter}")
+            result = mt5.order_send(order)
+            if result.retcode == mt5.TRADE_RETCODE_DONE:
+                print(f"NEW SHORT #{trade_counter} - Regime: TREND_DOWN")
+            else:
+                print(f"SHORT FAILED: {result.retcode} - {result.comment}")
+                trade_counter -= 1
 
         # Additional Short Entry (averaging)
         elif pos_price > 0 and good_short_ma_order and sma6L > pos_price and not hedge_active:
-            additional_sell_order["comment"] = f"RYU-SAVG-{trade_counter}"
-            result = mt5.order_send(additional_sell_order)
-            print(f"AVERAGING SHORT #{trade_counter}")
-            time.sleep(0.01)
-            mt5.order_send(sltp_request_sell_pos)
+            get_ask_bid()  # Refresh price before order
+            order = build_avg_sell_order(current_add_lot, pos_price, f"RYU-SAVG-{trade_counter}")
+            result = mt5.order_send(order)
+            if result.retcode == mt5.TRADE_RETCODE_DONE:
+                print(f"AVERAGING SHORT #{trade_counter}")
+                time.sleep(0.01)
+                sltp_order = build_sltp_sell(identifier, volume, pos_price)
+                sltp_result = mt5.order_send(sltp_order)
+                if sltp_result.retcode != mt5.TRADE_RETCODE_DONE:
+                    print(f"SLTP UPDATE FAILED: {sltp_result.retcode}")
+            else:
+                print(f"AVG SHORT FAILED: {result.retcode}")
 
     # ----- TREND_UP: Only LONG entries -----
     elif regime_state == "TREND_UP":
         # First Long Entry
         if long_pos_price == 0 and good_long_ma_order and not hedge_active:
             trade_counter += 1
-            buy_order["comment"] = f"RYU-LONG-{trade_counter}"
-            result = mt5.order_send(buy_order)
-            print(f"NEW LONG #{trade_counter} - Regime: TREND_UP")
+            get_ask_bid()  # Refresh price before order
+            order = build_buy_order(current_lot, f"RYU-LONG-{trade_counter}")
+            result = mt5.order_send(order)
+            if result.retcode == mt5.TRADE_RETCODE_DONE:
+                print(f"NEW LONG #{trade_counter} - Regime: TREND_UP")
+            else:
+                print(f"LONG FAILED: {result.retcode} - {result.comment}")
+                trade_counter -= 1
 
         # Additional Long Entry (averaging)
         elif long_pos_price > 0 and good_long_ma_order and sma6H < long_pos_price and not hedge_active:
-            additional_buy_order["comment"] = f"RYU-LAVG-{trade_counter}"
-            result = mt5.order_send(additional_buy_order)
-            print(f"AVERAGING LONG #{trade_counter}")
-            time.sleep(0.01)
-            mt5.order_send(sltp_request_buy_pos)
+            get_ask_bid()  # Refresh price before order
+            order = build_avg_buy_order(current_add_lot, long_pos_price, f"RYU-LAVG-{trade_counter}")
+            result = mt5.order_send(order)
+            if result.retcode == mt5.TRADE_RETCODE_DONE:
+                print(f"AVERAGING LONG #{trade_counter}")
+                time.sleep(0.01)
+                sltp_order = build_sltp_buy(long_identifier, long_volume, long_pos_price)
+                sltp_result = mt5.order_send(sltp_order)
+                if sltp_result.retcode != mt5.TRADE_RETCODE_DONE:
+                    print(f"SLTP UPDATE FAILED: {sltp_result.retcode}")
+            else:
+                print(f"AVG LONG FAILED: {result.retcode}")
 
     # ----- WARNING / TRANSITION: No new entries, manage existing -----
     elif regime_state in ["WARNING", "WARNING_BULL", "TRANSITION", "TRANSITION_BULL"]:
