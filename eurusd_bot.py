@@ -22,20 +22,25 @@ magic = 12345678
 
 # Symbol settings
 symbol = 'EURUSD'
-sl_multiplier = 13
-take_profit_short = 21
-sl_short = take_profit_short * sl_multiplier
 
-# Long position settings
+# Risk:Reward settings
+# TP = 21 pips, SL = 63 pips (1:3 R:R)
+# With hedge protection at 75% SL, effective risk is reduced
+take_profit_short = 21
 take_profit_long = 21
+sl_multiplier = 3  # SL = TP * multiplier (1:3 R:R recommended for scalping with hedge)
+sl_short = take_profit_short * sl_multiplier
 sl_long = take_profit_long * sl_multiplier
 
 # Hedge settings
 hedge_trigger_pct = 0.75  # Trigger hedge at 75% of SL (3/4)
 hedge_multiplier = 2.0  # Hedge size = 2x position
-rsi_trending_threshold = 70  # RSI above this = trending up
-candle_trend_count = 3  # Number of bullish candles to confirm trend
+rsi_trending_threshold = 70  # RSI above this = trending up (below 30 = down)
+candle_trend_count = 3  # Number of trending candles to confirm
 candle_body_pct = 0.6  # Candle body must be 60% of total range
+
+# Risk management
+max_avg_entries = 5  # Maximum averaging entries before stopping
 
 # Compression detection settings (dynamic lot sizing) - uses H1 timeframe
 compression_lookback = 10  # H1 candles to calculate baseline average body
@@ -70,6 +75,8 @@ hedge_active = False
 hedge_identifier = 0
 short_entry_price = 0
 short_volume_at_hedge = 0
+long_entry_price_at_hedge = 0
+long_volume_at_hedge = 0
 
 # Track long positions
 long_pos_price = 0
@@ -148,6 +155,32 @@ def is_trending_up():
             bullish_count += 1
 
     candles_trending = bullish_count >= candle_trend_count
+
+    # Both conditions must be true for trending
+    return rsi_trending and candles_trending
+
+
+def is_trending_down():
+    """Check if market is trending down using RSI and candle analysis"""
+    global current_rsi, recent_candles
+
+    # Check RSI - below 30 indicates oversold/bearish trend
+    rsi_trending = current_rsi < (100 - rsi_trending_threshold)  # Below 30
+
+    # Check candles - count strong bearish candles
+    bearish_count = 0
+    for _, candle in recent_candles.iterrows():
+        candle_range = candle['high'] - candle['low']
+        if candle_range == 0:
+            continue
+        body = candle['close'] - candle['open']
+        body_ratio = abs(body) / candle_range
+
+        # Bearish candle with strong body
+        if body < 0 and body_ratio >= candle_body_pct:
+            bearish_count += 1
+
+    candles_trending = bearish_count >= candle_trend_count
 
     # Both conditions must be true for trending
     return rsi_trending and candles_trending
@@ -373,14 +406,16 @@ def update_regime_state():
 
     # ===== BEARISH FLIP LOGIC (TREND_UP -> TREND_DOWN) =====
     if regime_state in ["TREND_UP", "WARNING"]:
+        warning_triggered = False  # Only one warning per H4 candle
 
         # STEP A: Failure at VAH (early warning)
         if vah_daily and h4_high > vah_daily and h4_close < vah_daily:
             warning_count += 1
+            warning_triggered = True
             print(f"VAH FAILURE - Warning count: {warning_count}")
 
-        # STEP B: POC stops migrating (structural)
-        if poc_h4 and poc_h4_prev:
+        # STEP B: POC stops migrating (structural) - only if no warning yet
+        if not warning_triggered and poc_h4 and poc_h4_prev:
             poc_migration = abs(poc_h4 - poc_h4_prev)
             if poc_migration < poc_migration_threshold:
                 warning_count += 1
@@ -406,14 +441,16 @@ def update_regime_state():
 
     # ===== BULLISH FLIP LOGIC (TREND_DOWN -> TREND_UP) =====
     if regime_state in ["TREND_DOWN", "WARNING_BULL"]:
+        warning_triggered = False  # Only one warning per H4 candle
 
         # STEP A: Failure at VAL (early warning)
         if val_daily and h4_low < val_daily and h4_close > val_daily:
             warning_count += 1
+            warning_triggered = True
             print(f"VAL FAILURE - Warning count: {warning_count}")
 
-        # STEP B: POC stops migrating
-        if poc_h4 and poc_h4_prev:
+        # STEP B: POC stops migrating - only if no warning yet
+        if not warning_triggered and poc_h4 and poc_h4_prev:
             poc_migration = abs(poc_h4 - poc_h4_prev)
             if poc_migration < poc_migration_threshold:
                 warning_count += 1
@@ -645,8 +682,43 @@ def open_hedge():
     return result
 
 
+def open_hedge_long():
+    """Open a hedge (SELL) position at 2x the long volume"""
+    global hedge_active, hedge_identifier, long_entry_price_at_hedge, long_volume_at_hedge
+
+    total_long_vol = get_total_long_volume()
+    hedge_volume = round(total_long_vol * hedge_multiplier, 2)
+
+    # Store long info at time of hedge
+    long_entry_price_at_hedge = long_pos_price
+    long_volume_at_hedge = total_long_vol
+
+    hedge_order = {
+        "action": mt5.TRADE_ACTION_DEAL,
+        "symbol": symbol,
+        "volume": hedge_volume,
+        "type": mt5.ORDER_TYPE_SELL,
+        "price": bid,
+        "deviation": deviation,
+        "magic": magic,
+        "comment": f"RYU-HEDGE-L-{trade_counter}",
+        "type_time": mt5.ORDER_TIME_GTC,
+        "type_filling": mt5.ORDER_FILLING_IOC,
+    }
+
+    result = mt5.order_send(hedge_order)
+    if result.retcode == mt5.TRADE_RETCODE_DONE:
+        hedge_active = True
+        hedge_identifier = result.order
+        print(f"LONG HEDGE OPENED: {hedge_volume} lots @ {bid}")
+    else:
+        print(f"LONG HEDGE FAILED: {result.retcode}")
+
+    return result
+
+
 def close_all_positions():
-    """Close all positions (shorts and hedge)"""
+    """Close all positions (shorts, longs, and hedges)"""
     global hedge_active, hedge_identifier
 
     # Close all short positions
@@ -667,13 +739,31 @@ def close_all_positions():
         result = mt5.order_send(close_request)
         print(f"CLOSED SHORT {pos['identifier']}: {result.retcode}")
 
+    # Close all long positions
+    for pos in long_positions:
+        close_request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": symbol,
+            "volume": pos['volume'],
+            "type": mt5.ORDER_TYPE_SELL,  # Sell to close long
+            "position": pos['identifier'],
+            "price": bid,
+            "deviation": deviation,
+            "magic": magic,
+            "comment": f"RYU-CLOSE-L-{pos['identifier']}",
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": mt5.ORDER_FILLING_IOC,
+        }
+        result = mt5.order_send(close_request)
+        print(f"CLOSED LONG {pos['identifier']}: {result.retcode}")
+
     # Close all hedge positions
     for pos in hedge_positions:
         close_request = {
             "action": mt5.TRADE_ACTION_DEAL,
             "symbol": symbol,
             "volume": pos['volume'],
-            "type": mt5.ORDER_TYPE_SELL,  # Sell to close long
+            "type": mt5.ORDER_TYPE_SELL,  # Sell to close long hedge
             "position": pos['identifier'],
             "price": bid,
             "deviation": deviation,
@@ -885,8 +975,25 @@ while True:
             print(f"RSI: {current_rsi:.1f}")
 
             if is_trending_up():
-                print("TRENDING DETECTED - Opening hedge")
+                print("TRENDING UP - Opening hedge for short")
                 open_hedge()
+            else:
+                print("RANGING - No hedge needed, expecting reversal")
+
+    # ==========================================
+    # HEDGE TRIGGER - At 3/4 of Stop Loss (for longs)
+    # ==========================================
+    if long_pos_price > 0 and not hedge_active:
+        drawdown_points = (long_pos_price - bid) / point
+        hedge_trigger_points = sl_long * hedge_trigger_pct
+
+        if drawdown_points >= hedge_trigger_points:
+            print(f"LONG DRAWDOWN: {drawdown_points:.1f} pts (Trigger: {hedge_trigger_points:.1f})")
+            print(f"RSI: {current_rsi:.1f}")
+
+            if is_trending_down():
+                print("TRENDING DOWN - Opening hedge for long")
+                open_hedge_long()
             else:
                 print("RANGING - No hedge needed, expecting reversal")
 
@@ -909,20 +1016,23 @@ while True:
                 print(f"SHORT FAILED: {result.retcode} - {result.comment}")
                 trade_counter -= 1
 
-        # Additional Short Entry (averaging)
+        # Additional Short Entry (averaging) - with max limit
         elif pos_price > 0 and good_short_ma_order and sma6L > pos_price and not hedge_active:
-            get_ask_bid()  # Refresh price before order
-            order = build_avg_sell_order(current_add_lot, pos_price, f"RYU-SAVG-{trade_counter}")
-            result = mt5.order_send(order)
-            if result.retcode == mt5.TRADE_RETCODE_DONE:
-                print(f"AVERAGING SHORT #{trade_counter}")
-                time.sleep(0.01)
-                sltp_order = build_sltp_sell(identifier, volume, pos_price)
-                sltp_result = mt5.order_send(sltp_order)
-                if sltp_result.retcode != mt5.TRADE_RETCODE_DONE:
-                    print(f"SLTP UPDATE FAILED: {sltp_result.retcode}")
+            if len(short_positions) >= max_avg_entries:
+                print(f"MAX AVG REACHED ({max_avg_entries}) - No more short averaging")
             else:
-                print(f"AVG SHORT FAILED: {result.retcode}")
+                get_ask_bid()  # Refresh price before order
+                order = build_avg_sell_order(current_add_lot, pos_price, f"RYU-SAVG-{trade_counter}")
+                result = mt5.order_send(order)
+                if result.retcode == mt5.TRADE_RETCODE_DONE:
+                    print(f"AVERAGING SHORT #{trade_counter} ({len(short_positions)+1}/{max_avg_entries})")
+                    time.sleep(0.01)
+                    sltp_order = build_sltp_sell(identifier, volume, pos_price)
+                    sltp_result = mt5.order_send(sltp_order)
+                    if sltp_result.retcode != mt5.TRADE_RETCODE_DONE:
+                        print(f"SLTP UPDATE FAILED: {sltp_result.retcode}")
+                else:
+                    print(f"AVG SHORT FAILED: {result.retcode}")
 
     # ----- TREND_UP: Only LONG entries -----
     elif regime_state == "TREND_UP":
@@ -938,20 +1048,23 @@ while True:
                 print(f"LONG FAILED: {result.retcode} - {result.comment}")
                 trade_counter -= 1
 
-        # Additional Long Entry (averaging)
+        # Additional Long Entry (averaging) - with max limit
         elif long_pos_price > 0 and good_long_ma_order and sma6H < long_pos_price and not hedge_active:
-            get_ask_bid()  # Refresh price before order
-            order = build_avg_buy_order(current_add_lot, long_pos_price, f"RYU-LAVG-{trade_counter}")
-            result = mt5.order_send(order)
-            if result.retcode == mt5.TRADE_RETCODE_DONE:
-                print(f"AVERAGING LONG #{trade_counter}")
-                time.sleep(0.01)
-                sltp_order = build_sltp_buy(long_identifier, long_volume, long_pos_price)
-                sltp_result = mt5.order_send(sltp_order)
-                if sltp_result.retcode != mt5.TRADE_RETCODE_DONE:
-                    print(f"SLTP UPDATE FAILED: {sltp_result.retcode}")
+            if len(long_positions) >= max_avg_entries:
+                print(f"MAX AVG REACHED ({max_avg_entries}) - No more long averaging")
             else:
-                print(f"AVG LONG FAILED: {result.retcode}")
+                get_ask_bid()  # Refresh price before order
+                order = build_avg_buy_order(current_add_lot, long_pos_price, f"RYU-LAVG-{trade_counter}")
+                result = mt5.order_send(order)
+                if result.retcode == mt5.TRADE_RETCODE_DONE:
+                    print(f"AVERAGING LONG #{trade_counter} ({len(long_positions)+1}/{max_avg_entries})")
+                    time.sleep(0.01)
+                    sltp_order = build_sltp_buy(long_identifier, long_volume, long_pos_price)
+                    sltp_result = mt5.order_send(sltp_order)
+                    if sltp_result.retcode != mt5.TRADE_RETCODE_DONE:
+                        print(f"SLTP UPDATE FAILED: {sltp_result.retcode}")
+                else:
+                    print(f"AVG LONG FAILED: {result.retcode}")
 
     # ----- WARNING / TRANSITION: No new entries, manage existing -----
     elif regime_state in ["WARNING", "WARNING_BULL", "TRANSITION", "TRANSITION_BULL"]:
