@@ -57,7 +57,7 @@ regime_state = "TREND_UP"  # Current regime state
 warning_count = 0  # Warnings before transition
 poc_threshold_pct = 0.15  # POC migration threshold (15% of H4 range)
 flip_cooldown = 0  # Cooldown counter (in H4 candles)
-flip_cooldown_max = 2  # Wait 2 H4 candles after flip before allowing new flip
+flip_cooldown_max = 1  # Wait 1 H4 candle after flip before allowing new flip (faster)
 last_h4_time = 0  # Track last processed H4 candle
 
 # Volume Profile approximation settings
@@ -115,15 +115,17 @@ def get_sma():
     df.drop(columns=['time'], inplace=True)
     df['sma_6H'] = ta.trend.sma_indicator(df['high'], window=6)
     df['sma_6L'] = ta.trend.sma_indicator(df['low'], window=6)
+    df['ema_6'] = ta.trend.ema_indicator(df['close'], window=6)
     df['sma_33'] = ta.trend.sma_indicator(df['close'], window=33)
     df['sma_60'] = ta.trend.sma_indicator(df['close'], window=60)
     df['sma_120'] = ta.trend.sma_indicator(df['close'], window=120)
     df['sma_240'] = ta.trend.sma_indicator(df['close'], window=240)
     df['rsi'] = ta.momentum.rsi(df['close'], window=14)
 
-    global sma6H, sma6L, sma33, sma60, sma120, sma240, current_rsi, recent_candles
+    global sma6H, sma6L, ema6, sma33, sma60, sma120, sma240, current_rsi, recent_candles
     sma6H = df['sma_6H'].iloc[-1]
     sma6L = df['sma_6L'].iloc[-1]
+    ema6 = df['ema_6'].iloc[-1]
     sma33 = df['sma_33'].iloc[-1]
     sma60 = df['sma_60'].iloc[-1]
     sma120 = df['sma_120'].iloc[-1]
@@ -423,8 +425,8 @@ def update_regime_state():
                 warning_count += 1
                 print(f"POC STALLED - Warning count: {warning_count}")
 
-        # Move to WARNING after 2 warnings
-        if warning_count >= 2 and regime_state == "TREND_UP":
+        # Move to WARNING after 1 warning (faster response)
+        if warning_count >= 1 and regime_state == "TREND_UP":
             regime_state = "WARNING"
             print("STATE: TREND_UP -> WARNING")
 
@@ -458,8 +460,8 @@ def update_regime_state():
                 warning_count += 1
                 print(f"POC STALLED (BULL) - Warning count: {warning_count}")
 
-        # Move to WARNING_BULL after 2 warnings
-        if warning_count >= 2 and regime_state == "TREND_DOWN":
+        # Move to WARNING_BULL after 1 warning (faster response)
+        if warning_count >= 1 and regime_state == "TREND_DOWN":
             regime_state = "WARNING_BULL"
             print("STATE: TREND_DOWN -> WARNING_BULL")
 
@@ -952,9 +954,15 @@ while True:
     current_lot = get_dynamic_lot()
     current_add_lot = get_dynamic_add_lot()
 
-    # MA conditions for entries
-    good_short_ma_order = bid > sma6H
-    good_long_ma_order = ask < sma6L
+    # Trend filter using 6 EMA
+    # TREND_UP: only enter longs when price > 6 EMA
+    # TREND_DOWN: only enter shorts when price < 6 EMA
+    price_above_ema = bid > ema6
+    price_below_ema = ask < ema6
+
+    # Entry conditions: trend-aligned via EMA
+    good_long_ma_order = price_above_ema   # Long when price above 6 EMA
+    good_short_ma_order = price_below_ema  # Short when price below 6 EMA
 
     # ==========================================
     # HEDGE LOGIC - Check for recovery first
