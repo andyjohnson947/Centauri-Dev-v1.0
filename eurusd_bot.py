@@ -402,7 +402,9 @@ def update_regime_state():
     poc_migration_threshold = h4_range * poc_threshold_pct
 
     print(f"Regime: {regime_state} | Warnings: {warning_count} | Daily permits: {daily_permits}")
-    print(f"H4 close: {h4_close:.5f} | POC_D1: {poc_daily:.5f if poc_daily else 0} | VAH_D1: {vah_daily:.5f if vah_daily else 0}")
+    poc_d1_str = f"{poc_daily:.5f}" if poc_daily else "N/A"
+    vah_d1_str = f"{vah_daily:.5f}" if vah_daily else "N/A"
+    print(f"H4 close: {h4_close:.5f} | POC_D1: {poc_d1_str} | VAH_D1: {vah_d1_str}")
 
     # ===== BEARISH FLIP LOGIC (TREND_UP -> TREND_DOWN) =====
     if regime_state in ["TREND_UP", "WARNING"]:
